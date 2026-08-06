@@ -1,0 +1,257 @@
+package check
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const MaxTargets = 1000
+
+type Endpoint struct {
+	Input      string `json:"input"`
+	Address    string `json:"address"`
+	ServerName string `json:"serverName"`
+}
+
+type Result struct {
+	Target         string   `json:"target"`
+	Address        string   `json:"address"`
+	Status         string   `json:"status"`
+	Errors         []string `json:"errors,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
+	Subject        string   `json:"subject,omitempty"`
+	Issuer         string   `json:"issuer,omitempty"`
+	DNSNames       int      `json:"dnsNames,omitempty"`
+	NotBefore      string   `json:"notBefore,omitempty"`
+	NotAfter       string   `json:"notAfter,omitempty"`
+	DaysRemaining  float64  `json:"daysRemaining,omitempty"`
+	Fingerprint    string   `json:"sha256Fingerprint,omitempty"`
+	TLSVersion     string   `json:"tlsVersion,omitempty"`
+	CipherSuite    string   `json:"cipherSuite,omitempty"`
+	VerifiedChains int      `json:"verifiedChains,omitempty"`
+	OCSPStapled    bool     `json:"ocspStapled"`
+	DurationMillis int64    `json:"durationMillis"`
+}
+
+type Options struct {
+	Timeout        time.Duration
+	Concurrency    int
+	WarnBefore     time.Duration
+	CriticalBefore time.Duration
+	MinTLS         uint16
+	RequireOCSP    bool
+	Roots          *x509.CertPool
+	Now            func() time.Time
+	DialContext    func(context.Context, string, string) (net.Conn, error)
+}
+
+func ParseEndpoint(input string) (Endpoint, error) {
+	original := strings.TrimSpace(input)
+	if original == "" {
+		return Endpoint{}, errors.New("empty target")
+	}
+	if strings.ContainsAny(original, "\r\n\t ") {
+		return Endpoint{}, errors.New("target contains whitespace")
+	}
+	hostport := original
+	if strings.Contains(original, "://") {
+		u, err := url.Parse(original)
+		if err != nil {
+			return Endpoint{}, err
+		}
+		if strings.ToLower(u.Scheme) != "https" {
+			return Endpoint{}, errors.New("only https URLs are accepted")
+		}
+		if u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+			return Endpoint{}, errors.New("URL must not contain credentials, path, query, or fragment")
+		}
+		hostport = u.Host
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		if net.ParseIP(hostport) != nil {
+			host, port = hostport, "443"
+		} else if strings.Contains(hostport, ":") {
+			return Endpoint{}, fmt.Errorf("invalid host:port: %w", err)
+		} else {
+			host, port = hostport, "443"
+		}
+	}
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return Endpoint{}, errors.New("host is empty")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return Endpoint{}, errors.New("port must be between 1 and 65535")
+	}
+	serverName := host
+	if strings.HasSuffix(serverName, ".") {
+		serverName = strings.TrimSuffix(serverName, ".")
+	}
+	if strings.ContainsAny(serverName, "/\\") {
+		return Endpoint{}, errors.New("invalid host")
+	}
+	return Endpoint{Input: original, Address: net.JoinHostPort(host, strconv.Itoa(portNumber)), ServerName: serverName}, nil
+}
+
+func Run(ctx context.Context, endpoints []Endpoint, opts Options) []Result {
+	if opts.Timeout <= 0 {
+		opts.Timeout = 10 * time.Second
+	}
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = 8
+	}
+	if opts.Concurrency > 32 {
+		opts.Concurrency = 32
+	}
+	if opts.WarnBefore == 0 {
+		opts.WarnBefore = 30 * 24 * time.Hour
+	}
+	if opts.CriticalBefore == 0 {
+		opts.CriticalBefore = 7 * 24 * time.Hour
+	}
+	if opts.MinTLS == 0 {
+		opts.MinTLS = tls.VersionTLS12
+	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.DialContext == nil {
+		dialer := &net.Dialer{Timeout: opts.Timeout}
+		opts.DialContext = dialer.DialContext
+	}
+	results := make([]Result, len(endpoints))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	workers := opts.Concurrency
+	if workers > len(endpoints) {
+		workers = len(endpoints)
+	}
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				results[index] = one(ctx, endpoints[index], opts)
+			}
+		}()
+	}
+	for i := range endpoints {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return results
+}
+
+func one(parent context.Context, endpoint Endpoint, opts Options) Result {
+	start := time.Now()
+	result := Result{Target: endpoint.Input, Address: endpoint.Address, Status: "ok"}
+	ctx, cancel := context.WithTimeout(parent, opts.Timeout)
+	defer cancel()
+	raw, err := opts.DialContext(ctx, "tcp", endpoint.Address)
+	if err != nil {
+		result.Errors = []string{"connect: " + safeError(err)}
+		result.Status = "critical"
+		result.DurationMillis = time.Since(start).Milliseconds()
+		return result
+	}
+	defer raw.Close()
+	config := &tls.Config{ServerName: endpoint.ServerName, MinVersion: opts.MinTLS, RootCAs: opts.Roots}
+	conn := tls.Client(raw, config)
+	if err := conn.HandshakeContext(ctx); err != nil {
+		result.Errors = []string{"TLS handshake: " + safeError(err)}
+		result.Status = "critical"
+		result.DurationMillis = time.Since(start).Milliseconds()
+		return result
+	}
+	state := conn.ConnectionState()
+	result.TLSVersion = tlsVersion(state.Version)
+	result.CipherSuite = tls.CipherSuiteName(state.CipherSuite)
+	result.VerifiedChains = len(state.VerifiedChains)
+	result.OCSPStapled = len(state.OCSPResponse) > 0
+	if len(state.PeerCertificates) == 0 {
+		result.Errors = append(result.Errors, "peer sent no certificate")
+		result.Status = "critical"
+	} else {
+		cert := state.PeerCertificates[0]
+		now := opts.Now().UTC()
+		result.Subject = cert.Subject.String()
+		result.Issuer = cert.Issuer.String()
+		result.DNSNames = len(cert.DNSNames)
+		result.NotBefore = cert.NotBefore.UTC().Format(time.RFC3339)
+		result.NotAfter = cert.NotAfter.UTC().Format(time.RFC3339)
+		result.DaysRemaining = cert.NotAfter.Sub(now).Hours() / 24
+		sum := sha256.Sum256(cert.Raw)
+		result.Fingerprint = hex.EncodeToString(sum[:])
+		if now.Before(cert.NotBefore) {
+			result.Errors = append(result.Errors, "certificate is not yet valid")
+		}
+		remaining := cert.NotAfter.Sub(now)
+		if remaining <= 0 {
+			result.Errors = append(result.Errors, "certificate has expired")
+		} else if remaining <= opts.CriticalBefore {
+			result.Errors = append(result.Errors, "certificate expires inside critical window")
+		} else if remaining <= opts.WarnBefore {
+			result.Warnings = append(result.Warnings, "certificate expires inside warning window")
+		}
+	}
+	if opts.RequireOCSP && !result.OCSPStapled {
+		result.Errors = append(result.Errors, "server did not staple an OCSP response")
+	}
+	if len(result.Errors) > 0 {
+		result.Status = "critical"
+	} else if len(result.Warnings) > 0 {
+		result.Status = "warning"
+	}
+	sort.Strings(result.Errors)
+	sort.Strings(result.Warnings)
+	result.DurationMillis = time.Since(start).Milliseconds()
+	return result
+}
+
+func tlsVersion(v uint16) string {
+	switch v {
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	default:
+		return fmt.Sprintf("0x%04x", v)
+	}
+}
+func safeError(err error) string {
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "DNS lookup failed"
+	}
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if errors.Is(err, context.DeadlineExceeded) || opErr.Timeout() {
+			return "connection timed out"
+		}
+		return opErr.Op + " failed"
+	}
+	text := err.Error()
+	if len(text) > 240 {
+		text = text[:240]
+	}
+	return text
+}
