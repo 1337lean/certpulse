@@ -1,10 +1,10 @@
 # Third-party notices
 
-Certpulse distributes code from the following dependency in its compiled binaries.
+Certpulse binaries include code from the Go standard library and the following Go module. Both are distributed under the Go Authors' BSD 3-Clause license reproduced below.
 
-## golang.org/x/crypto
+## Go standard library and `golang.org/x/crypto`
 
-Package used: `golang.org/x/crypto/ocsp` (`v0.54.0`)
+External package used: `golang.org/x/crypto/ocsp` (`v0.54.0`)
 
 Copyright 2009 The Go Authors.
 
