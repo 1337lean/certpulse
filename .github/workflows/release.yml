@@ -54,7 +54,7 @@ jobs:
             GOPROXY=direct \
             GOWORK=off \
             go install "github.com/1337lean/certpulse/cmd/certpulse@${GITHUB_REF_NAME}"
-          "$clean_dir/bin/certpulse" version >/dev/null
+          test "$("$clean_dir/bin/certpulse" version)" = "${GITHUB_REF_NAME#v}"
       - name: Publish verified release
         env:
           GH_TOKEN: ${{ github.token }}
