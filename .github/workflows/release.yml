@@ -9,41 +9,61 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  GO_VERSION: 1.25.x
+  GORELEASER_VERSION: v2.17.0
+
 jobs:
   release:
+    name: Build, verify, publish, and attest
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Set up Go
         uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
         with:
-          go-version: '1.25.x'
+          go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: Test release source
-        run: go test ./...
-      - name: Build and publish release
+      - name: Verify source
+        run: |
+          test -z "$(gofmt -l .)"
+          go test -race ./...
+          go vet ./...
+      - name: Build release without publishing
         uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
         with:
           distribution: goreleaser
-          version: v2.17.0
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Verify packaged archive
+          version: ${{ env.GORELEASER_VERSION }}
+          args: release --clean --skip=publish
+      - name: Verify every archive and checksum
+        run: scripts/verify-release.sh dist "${GITHUB_REF_NAME#v}"
+      - name: Test documented install path in a clean environment
+        shell: bash
         run: |
-          verify_dir="$(mktemp -d)"
-          archive="$(find dist -maxdepth 1 -name 'certpulse_*_linux_amd64.tar.gz' -print -quit)"
-          test -n "$archive"
-          tar -xzf "$archive" -C "$verify_dir"
-          version_output="$("$verify_dir/certpulse" version)"
-          test -n "$version_output"
-          test "$version_output" != "dev"
-          test -f "$verify_dir/LICENSE"
-          test -f "$verify_dir/README.md"
-      - name: Attest archives and checksums
+          clean_dir="$(mktemp -d)"
+          env \
+            GOBIN="$clean_dir/bin" \
+            GOPATH="$clean_dir/gopath" \
+            GOMODCACHE="$clean_dir/modcache" \
+            GOPROXY=direct \
+            GOWORK=off \
+            go install "github.com/1337lean/certpulse/cmd/certpulse@${GITHUB_REF_NAME}"
+          "$clean_dir/bin/certpulse" version >/dev/null
+      - name: Publish verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/*.tar.gz dist/*.zip dist/checksums.txt \
+            --verify-tag \
+            --generate-notes \
+            --title "Certpulse $GITHUB_REF_NAME"
+      - name: Attest verified release artifacts
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
         with:
           subject-path: |

@@ -15,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/1337lean/certpulse/internal/textsafe"
+	"golang.org/x/crypto/ocsp"
 )
 
 const MaxTargets = 1000
@@ -58,11 +61,17 @@ type Options struct {
 }
 
 func ParseEndpoint(input string) (Endpoint, error) {
-	original := strings.TrimSpace(input)
+	if textsafe.HasControl(input) {
+		return Endpoint{}, errors.New("target contains a control character")
+	}
+	original := input
 	if original == "" {
 		return Endpoint{}, errors.New("empty target")
 	}
-	if strings.ContainsAny(original, "\r\n\t ") {
+	if strings.IndexFunc(original, func(r rune) bool { return r == ' ' || r > 127 }) >= 0 {
+		if strings.IndexFunc(original, func(r rune) bool { return r > 127 }) >= 0 {
+			return Endpoint{}, errors.New("unicode hostnames are not accepted; use their ASCII IDNA form")
+		}
 		return Endpoint{}, errors.New("target contains whitespace")
 	}
 	hostport := original
@@ -81,7 +90,9 @@ func ParseEndpoint(input string) (Endpoint, error) {
 	}
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil {
-		if net.ParseIP(hostport) != nil {
+		if strings.HasPrefix(hostport, "[") && strings.HasSuffix(hostport, "]") && net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")) != nil {
+			host, port = hostport[1:len(hostport)-1], "443"
+		} else if net.ParseIP(hostport) != nil {
 			host, port = hostport, "443"
 		} else if strings.Contains(hostport, ":") {
 			return Endpoint{}, fmt.Errorf("invalid host:port: %w", err)
@@ -97,14 +108,34 @@ func ParseEndpoint(input string) (Endpoint, error) {
 	if err != nil || portNumber < 1 || portNumber > 65535 {
 		return Endpoint{}, errors.New("port must be between 1 and 65535")
 	}
-	serverName := host
-	if strings.HasSuffix(serverName, ".") {
-		serverName = strings.TrimSuffix(serverName, ".")
-	}
-	if strings.ContainsAny(serverName, "/\\") {
-		return Endpoint{}, errors.New("invalid host")
+	serverName := strings.TrimSuffix(host, ".")
+	if net.ParseIP(serverName) == nil {
+		if err := validateHostname(serverName); err != nil {
+			return Endpoint{}, err
+		}
 	}
 	return Endpoint{Input: original, Address: net.JoinHostPort(host, strconv.Itoa(portNumber)), ServerName: serverName}, nil
+}
+
+func validateHostname(host string) error {
+	if len(host) > 253 {
+		return errors.New("hostname exceeds 253 bytes")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return errors.New("hostname contains an empty or oversized label")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("hostname labels must not begin or end with a hyphen")
+		}
+		for _, c := range []byte(label) {
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' {
+				continue
+			}
+			return errors.New("hostname contains a character outside letters, digits, dots, and hyphens")
+		}
+	}
+	return nil
 }
 
 func Run(ctx context.Context, endpoints []Endpoint, opts Options) []Result {
@@ -209,8 +240,12 @@ func one(parent context.Context, endpoint Endpoint, opts Options) Result {
 			result.Warnings = append(result.Warnings, "certificate expires inside warning window")
 		}
 	}
-	if opts.RequireOCSP && !result.OCSPStapled {
-		result.Errors = append(result.Errors, "server did not staple an OCSP response")
+	if opts.RequireOCSP {
+		if !result.OCSPStapled {
+			result.Errors = append(result.Errors, "server did not staple an OCSP response")
+		} else if err := validateOCSP(state, opts.Now().UTC()); err != nil {
+			result.Errors = append(result.Errors, err.Error())
+		}
 	}
 	if len(result.Errors) > 0 {
 		result.Status = "critical"
@@ -253,5 +288,63 @@ func safeError(err error) string {
 	if len(text) > 240 {
 		text = text[:240]
 	}
-	return text
+	return textsafe.Terminal(text)
+}
+
+func validateOCSP(state tls.ConnectionState, now time.Time) error {
+	if len(state.PeerCertificates) == 0 {
+		return errors.New("cannot validate the OCSP staple without a leaf certificate")
+	}
+	leaf := state.PeerCertificates[0]
+	issuer := certificateIssuer(state, leaf)
+	if issuer == nil {
+		return errors.New("cannot validate the OCSP staple without the leaf certificate issuer")
+	}
+	parsed, err := ocsp.ParseResponse(state.OCSPResponse, nil)
+	if err != nil {
+		return errors.New("stapled OCSP response is malformed or unsuccessful")
+	}
+	if parsed.SerialNumber == nil || parsed.SerialNumber.Cmp(leaf.SerialNumber) != 0 {
+		return errors.New("stapled OCSP response belongs to a different certificate")
+	}
+	response, err := ocsp.ParseResponseForCert(state.OCSPResponse, leaf, issuer)
+	if err != nil {
+		return errors.New("stapled OCSP response does not validate for the leaf certificate and issuer")
+	}
+	switch response.Status {
+	case ocsp.Good:
+	case ocsp.Revoked:
+		return errors.New("stapled OCSP response reports the certificate as revoked")
+	case ocsp.Unknown:
+		return errors.New("stapled OCSP response reports the certificate status as unknown")
+	default:
+		return errors.New("stapled OCSP response has an unsupported certificate status")
+	}
+	if response.ThisUpdate.IsZero() || response.ThisUpdate.After(now) {
+		return errors.New("stapled OCSP response is not yet valid")
+	}
+	if !response.ProducedAt.IsZero() && response.ProducedAt.After(now) {
+		return errors.New("stapled OCSP response was produced in the future")
+	}
+	if response.NextUpdate.IsZero() {
+		return errors.New("stapled OCSP response has no expiry time")
+	}
+	if response.NextUpdate.Before(now) {
+		return errors.New("stapled OCSP response is stale")
+	}
+	return nil
+}
+
+func certificateIssuer(state tls.ConnectionState, leaf *x509.Certificate) *x509.Certificate {
+	for _, chain := range state.VerifiedChains {
+		if len(chain) > 1 && chain[0].Equal(leaf) && leaf.CheckSignatureFrom(chain[1]) == nil {
+			return chain[1]
+		}
+	}
+	for _, candidate := range state.PeerCertificates[1:] {
+		if leaf.CheckSignatureFrom(candidate) == nil {
+			return candidate
+		}
+	}
+	return nil
 }

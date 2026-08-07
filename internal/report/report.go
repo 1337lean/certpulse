@@ -4,10 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 
 	"github.com/1337lean/certpulse/internal/check"
+	"github.com/1337lean/certpulse/internal/textsafe"
 )
 
 func Human(w io.Writer, results []check.Result) error {
@@ -18,7 +18,7 @@ func Human(w io.Writer, results []check.Result) error {
 		} else if r.Status == "warning" {
 			detail = strings.Join(r.Warnings, "; ")
 		}
-		if _, err := fmt.Fprintf(w, "%-8s %-32s %s\n", strings.ToUpper(r.Status), r.Target, detail); err != nil {
+		if _, err := fmt.Fprintf(w, "%-8s %-32s %s\n", strings.ToUpper(r.Status), textsafe.Terminal(r.Target), textsafe.Terminal(detail)); err != nil {
 			return err
 		}
 	}
@@ -45,7 +45,7 @@ func Prometheus(w io.Writer, results []check.Result) error {
 		} else if r.Status == "critical" {
 			status = 2
 		}
-		label := strconv.Quote(r.Target)
+		label := prometheusLabel(r.Target)
 		if _, err := fmt.Fprintf(w, "certpulse_status{target=%s} %d\n", label, status); err != nil {
 			return err
 		}
@@ -56,4 +56,27 @@ func Prometheus(w io.Writer, results []check.Result) error {
 		}
 	}
 	return nil
+}
+
+func prometheusLabel(value string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range value {
+		switch r {
+		case '\\':
+			b.WriteString("\\\\")
+		case '"':
+			b.WriteString("\\\"")
+		case '\n':
+			b.WriteString("\\n")
+		default:
+			if r < 0x20 || r >= 0x7f && r <= 0x9f {
+				b.WriteRune('\uFFFD')
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }

@@ -1,11 +1,16 @@
 # Contributing
 
-Use Go 1.25 and keep runtime code standard-library-only. Network behavior must remain bounded and cancellation-aware. Run:
+Use Go 1.25, keep the dependency set minimal and reviewed, and keep network behavior bounded and cancellation-aware. Run:
 
 ```sh
 gofmt -w .
 go vet ./...
 go test ./...
 go test -race ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+go run github.com/goreleaser/goreleaser/v2@v2.17.0 check
 go build ./cmd/certpulse
 ```
+
+Add focused regression tests for behavioral changes. Keep error text free of secrets and attacker-controlled control characters. Pull requests must pass CI on Linux, macOS, and Windows; releases are built without publishing, verified, and only then uploaded and attested.
